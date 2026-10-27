@@ -97,12 +97,19 @@ class CoreAdapter:
     async def handle_approval(
         self, result: EvaluationResult, context: ActivityContext | None = None
     ) -> None:
-        if self._poller is None or not result.approval_id:
+        if self._poller is None:
             raise ApprovalRejectedError(
                 "REQUIRE_APPROVAL verdict but no approval flow is configured — "
                 "failing safe (operation not run)"
             )
+        # The approval is polled by workflow/run/activity id. Core's verdict
+        # carries no approval_id, so that is not required here.
         workflow_id, run_id, activity_id = _approval_poll_ids(result, context)
+        if not (workflow_id and run_id and activity_id):
+            raise ApprovalRejectedError(
+                "REQUIRE_APPROVAL verdict without the workflow/run/activity ids to "
+                "poll — failing safe (operation not run)"
+            )
         approval = await self._poller.await_decision(workflow_id, run_id, activity_id)
         if approval.allow_shaped:
             return

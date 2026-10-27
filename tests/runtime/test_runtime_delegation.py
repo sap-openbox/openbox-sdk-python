@@ -177,6 +177,24 @@ class TestCoreAdapterDefaults:
         await adapter.handle_approval(result)
         assert seen == [("wf-raw", "run-raw", "act-raw")]
 
+    async def test_core_adapter_polls_without_approval_id(self):
+        # Core's REQUIRE_APPROVAL verdict carries no approval_id; the poll is
+        # keyed by the activity, so the wait must still happen.
+        seen: list[tuple[str, str, str]] = []
+        poller = ApprovalPoller(_IdRecordingClient(seen), poll_interval_seconds=0.001)
+        adapter = CoreAdapter(approval_poller=poller)
+        ctx = ActivityContext(workflow_id="wf-9", run_id="run-9", activity_id="act-9")
+        await adapter.handle_approval(EvaluationResult(verdict=Verdict.REQUIRE_APPROVAL), context=ctx)
+        assert seen == [("wf-9", "run-9", "act-9")]
+
+    async def test_core_adapter_approval_fails_safe_without_poll_ids(self):
+        seen: list[tuple[str, str, str]] = []
+        poller = ApprovalPoller(_IdRecordingClient(seen), poll_interval_seconds=0.001)
+        adapter = CoreAdapter(approval_poller=poller)
+        with pytest.raises(ApprovalRejectedError, match="failing safe"):
+            await adapter.handle_approval(EvaluationResult(verdict=Verdict.REQUIRE_APPROVAL))
+        assert seen == []
+
     def test_protocol_conformance(self):
         assert isinstance(CoreAdapter(), FrameworkAdapter)
         assert isinstance(RecordingAdapter(), FrameworkAdapter)
