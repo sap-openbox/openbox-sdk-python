@@ -41,6 +41,9 @@ class HookType(str, Enum):
     FILE_OPERATION = "file_operation"
     FUNCTION_CALL = "function_call"
     LLM_CALL = "llm_call"  # reserved; disabled until provider hooks are implemented
+    # OpenRouter's record of who served a completion, read back after the call
+    # (instrumentation/openrouter_provenance.py).
+    LLM_PROVENANCE = "llm_provenance"
 
 
 def _span_context_of(span: Any) -> Any:
@@ -97,6 +100,7 @@ _DEFAULT_KIND_BY_HOOK: dict[str, str] = {
     "file_operation": "INTERNAL",
     "function_call": "INTERNAL",
     "llm_call": "CLIENT",
+    "llm_provenance": "CLIENT",
 }
 
 # Family-specific root fields that must exist, null-valued when unavailable, so

@@ -59,6 +59,26 @@ A response closed before transport EOF records the consumed prefix and sets
 that stop reading after an SSE end marker and then close the HTTP response.
 Stream read failures retain their original exception and report partial evidence.
 
+## OpenRouter routing provenance
+
+With the `http` extra installed, a governed `httpx` call to `openrouter.ai` made
+inside an activity also reports which upstream provider served it. After the
+response arrives, the SDK sends Core an `llm_provenance` span carrying
+`gen_ai.generation.id`, the upstream provider and served model, cost and token
+usage, finish reason, and whether the requested model and `provider.only`
+routing were honoured (`gen_ai.*`, `openbox.routing.*`, `openbox.model.*`).
+The dashboard's Provenance tab, shown for agents whose workflow engine is
+OpenRouter, aggregates these spans.
+
+- The lookup runs on a background thread and never delays or fails the model
+  call. It reuses the call's own `Authorization` header; no extra key is needed.
+- OpenRouter's generation record (which adds data region, latency and fallback
+  attempts) is published late, so it is tried for about ten seconds. When it is
+  not ready, the provenance in the completion response itself is sent instead.
+- `WorkflowCompleted` / `WorkflowFailed` wait for pending lookups, because Core
+  does not record spans that arrive after the session closes.
+- Set `OPENBOX_OPENROUTER_PROVENANCE=false` to turn it off.
+
 ## Okta AI Agent identity (`okta_ai_agent`)
 
 An agent whose OpenBox identity is verified against an Okta AI Agent credential

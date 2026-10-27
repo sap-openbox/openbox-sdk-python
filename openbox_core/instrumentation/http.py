@@ -22,6 +22,7 @@ from ..context import activity_scope
 from ..contracts.otel_spans import HookType
 from ..hooks.events import resolve_context
 from .http_stream import capture_async_response_stream, capture_response_stream
+from .openrouter_provenance import schedule_openrouter_provenance
 from .shared import get_hook_runtime
 
 logger = logging.getLogger(__name__)
@@ -575,6 +576,9 @@ def _install_httpx_body_capture(module_name: str) -> bool:
                         )
                         with activity_scope(context, store=runtime._store):
                             runtime.completed(span, hook_type=HookType.HTTP_REQUEST, fields=fields)
+                        schedule_openrouter_provenance(
+                            runtime, context, span, request, request_body, body
+                        )
                     finally:
                         span.end()
 
@@ -600,6 +604,9 @@ def _install_httpx_body_capture(module_name: str) -> bool:
                     response_body,
                     response_headers,
                 ),
+            )
+            schedule_openrouter_provenance(
+                runtime, context, span, request, request_body, response_body
             )
             return response
         finally:
@@ -646,6 +653,9 @@ def _install_httpx_body_capture(module_name: str) -> bool:
                             await runtime.acompleted(
                                 span, hook_type=HookType.HTTP_REQUEST, fields=fields
                             )
+                        schedule_openrouter_provenance(
+                            runtime, context, span, request, request_body, body
+                        )
                     finally:
                         span.end()
 
@@ -671,6 +681,9 @@ def _install_httpx_body_capture(module_name: str) -> bool:
                     response_body,
                     response_headers,
                 ),
+            )
+            schedule_openrouter_provenance(
+                runtime, context, span, request, request_body, response_body
             )
             return response
         finally:
