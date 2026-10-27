@@ -182,8 +182,9 @@ class HookRuntime:
         """Sync approval: adapter-native flow first, core poller fallback.
 
         An adapter exposing ``handle_approval_sync`` owns the flow. Returning
-        normally means approved. Without that seam, drive the core poller;
-        no poller / no approval_id ⇒ fail safe: blocked (the operation must
+        normally means approved. Without that seam, drive the core poller,
+        keyed by the activity — Core's verdict carries no approval_id. No
+        poller / no activity context ⇒ fail safe: blocked (the operation must
         not run on an unresolved approval).
         """
         ctx = resolve_context(self._store, span)
@@ -194,7 +195,7 @@ class HookRuntime:
             # for skip-HITL decisions and framework buffer correlation.
             adapter_sync(result, context=ctx)
             return True
-        if self._sync_poller is None or not result.approval_id or ctx is None:
+        if self._sync_poller is None or ctx is None:
             self._mark_stopped(result, span)
             self._adapter.raise_hook_blocked(result)  # NoReturn by contract
             # Defense in depth: a misbehaving adapter that RETURNS from its

@@ -132,8 +132,9 @@ class TestApprovalFlows:
         assert store.is_activity_aborted(ACTIVITY_CTX.workflow_id, ACTIVITY_CTX.activity_id)
 
     def test_sync_approval_without_hitl_fails_safe(self, store, adapter):
-        fake_core = FakeCore({"verdict": "require_approval"})  # no approval_id
+        fake_core = FakeCore({"verdict": "require_approval"})
         runtime = build_runtime(fake_core, adapter, store)
+        runtime.config.hitl.enabled = False
         hook_runtime = HookRuntime(runtime)
         token = store.bind(ACTIVITY_CTX)
         try:
@@ -141,6 +142,21 @@ class TestApprovalFlows:
                 hook_runtime.preflight(FakeSpan(), hook_type=HookType.HTTP_REQUEST)
         finally:
             store.reset(token)
+
+    def test_sync_approval_polls_without_approval_id(self, store, adapter):
+        # Core's REQUIRE_APPROVAL verdict carries no approval_id; the poll is
+        # keyed by the bound activity.
+        fake_core = FakeCore({"verdict": "require_approval"}, {"action": "allow"})
+        runtime = build_runtime(fake_core, adapter, store)
+        runtime.config.hitl.poll_interval_ms = 0
+        hook_runtime = HookRuntime(runtime)
+        token = store.bind(ACTIVITY_CTX)
+        try:
+            assert hook_runtime.preflight(FakeSpan(), hook_type=HookType.HTTP_REQUEST) is True
+        finally:
+            store.reset(token)
+        (poll,) = fake_core.approval_requests
+        assert poll["activity_id"] == ACTIVITY_CTX.activity_id
 
     async def test_async_approval_delegates_to_adapter(self, store, adapter):
         fake_core = FakeCore({"verdict": "require_approval", "approval_id": "app-1"})
