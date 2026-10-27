@@ -1,6 +1,6 @@
 [project]
 name = "openbox-sdk-python"
-version = "1.4.0"
+version = "1.5.0"
 description = "OpenBox base SDK - governance contracts, strict gate, identity/signing, evaluate client, context runtime, OTel span wire serialization, and generic instrumentation shared by every OpenBox framework SDK"
 authors = [
     { name = "OpenBox Team", email = "tino@openbox.ai" },

@@ -37,7 +37,7 @@ from .errors import (
 # governance; eagerly it can deadlock package init as a circular import, and
 # lazily it can recurse unboundedly when a per-request header builder resolves
 # the version. Keep in sync with pyproject.toml on release.
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 __all__ = [
     "__version__",

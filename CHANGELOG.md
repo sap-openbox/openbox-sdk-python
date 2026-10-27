@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-26
+
+### Added
+- OpenRouter routing provenance. After a governed `httpx` call to `openrouter.ai`
+  completes inside an activity, the SDK sends an `llm_provenance` span carrying
+  the generation id, upstream provider, served model, cost, token usage, finish
+  reason and requested-vs-honored routing (`gen_ai.*`, `openbox.routing.*`,
+  `openbox.model.*`). It looks up OpenRouter's generation record for about ten
+  seconds and falls back to the provenance in the completion response itself.
+  Disable with `OPENBOX_OPENROUTER_PROVENANCE=false`.
+- `HookType.LLM_PROVENANCE`.
+
+### Changed
+- `EvaluationClient.evaluate` / `aevaluate` wait for pending provenance lookups
+  before sending `WorkflowCompleted` or `WorkflowFailed`, since Core drops spans
+  that arrive after the session closes.
+
 ### Fixed
+- `CoreAdapter.handle_approval` no longer requires an `approval_id`. Core's
+  REQUIRE_APPROVAL verdict does not carry one, so every approval was rejected
+  without a wait. The approval is polled by workflow/run/activity id, and the
+  adapter still fails safe when those ids are missing.
 - Capture streamed text response bodies for sync/async `httpx` and `httpx2`
   requests without consuming the stream ahead of the caller. Emit completed
   telemetry once on EOF, close, or read failure, with bounded body capture and
