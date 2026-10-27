@@ -70,13 +70,18 @@ routing were honoured (`gen_ai.*`, `openbox.routing.*`, `openbox.model.*`).
 The dashboard's Provenance tab, shown for agents whose workflow engine is
 OpenRouter, aggregates these spans.
 
-- The lookup runs on a background thread and never delays or fails the model
-  call. It reuses the call's own `Authorization` header; no extra key is needed.
+- The lookup runs on a small pool of background (daemon) threads and never
+  delays or fails the model call. It reuses the call's own `Authorization`
+  header; no extra key is needed.
 - OpenRouter's generation record (which adds data region, latency and fallback
-  attempts) is published late, so it is tried for about ten seconds. When it is
+  attempts) is published late, so it is tried within a 12-second budget
+  (`LOOKUP_BUDGET_SECONDS`), counted from the end of the model call. When it is
   not ready, the provenance in the completion response itself is sent instead.
-- `WorkflowCompleted` / `WorkflowFailed` wait for pending lookups, because Core
-  does not record spans that arrive after the session closes.
+  A lookup rejected by OpenRouter (401/403/5xx) is logged with its status.
+- `WorkflowCompleted` / `WorkflowFailed` wait for that session's pending
+  lookups only (at most `DRAIN_TIMEOUT_SECONDS`, longer than the budget),
+  because Core does not record spans that arrive after the session closes.
+  `OpenBoxRuntime.close()` waits for any that remain.
 - Set `OPENBOX_OPENROUTER_PROVENANCE=false` to turn it off.
 
 ## Okta AI Agent identity (`okta_ai_agent`)

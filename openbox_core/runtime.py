@@ -15,6 +15,7 @@ enforcement (block/halt/approval) to the adapter callbacks.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from .adapters.base import CoreAdapter, FrameworkAdapter, adapter_accepts_context
@@ -142,13 +143,23 @@ class OpenBoxRuntime:
     # ── Shutdown ──────────────────────────────────────────────────────────
 
     def close(self) -> None:
-        """Uninstall instrumentation, clear correlation state, close transports."""
+        """Uninstall instrumentation, clear correlation state, close transports.
+
+        Pending OpenRouter provenance lookups are drained first (bounded); they
+        send through this runtime's client.
+        """
+        from .instrumentation.openrouter_provenance import drain_openrouter_provenance
+
+        drain_openrouter_provenance()
         self.uninstall_instrumentation()
         self.context_store.clear()
         self.client.close()
 
     async def aclose(self) -> None:
         """Async :meth:`close` (also closes the async transport)."""
+        from .instrumentation.openrouter_provenance import drain_openrouter_provenance
+
+        await asyncio.to_thread(drain_openrouter_provenance)
         self.uninstall_instrumentation()
         self.context_store.clear()
         await self.client.aclose()

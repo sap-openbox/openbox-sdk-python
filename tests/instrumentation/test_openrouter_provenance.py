@@ -1,9 +1,12 @@
 """OpenRouter routing provenance — record shaping, scheduling and the session drain."""
 
 import json
+import logging
 import threading
+import time
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from openbox_core import client as client_module
@@ -162,10 +165,17 @@ class TestRecordShaping:
         assert record["tokens_completion"] == 2
 
 
+def _attest(runtime, from_response=None):
+    prov._attest(
+        runtime, CONTEXT, None, GEN_ID, "Bearer k", "https://openrouter.ai", {}, from_response,
+        time.monotonic() + 5,
+    )
+
+
 class TestAttest:
     def test_prefers_the_generation_record(self, captured, monkeypatch):
-        monkeypatch.setattr(prov, "_fetch_generation_record", lambda *_a: GENERATION_RECORD)
-        prov._attest(captured, CONTEXT, None, GEN_ID, "Bearer k", "https://openrouter.ai", {}, None)
+        monkeypatch.setattr(prov, "_fetch_generation_record", lambda *_a: (GENERATION_RECORD, "found"))
+        _attest(captured)
         (call,) = captured.calls
         assert call["hook_type"] is HookType.LLM_PROVENANCE
         assert call["fields"]["attributes"]["gen_ai.upstream.data_region"] == "global"
@@ -173,9 +183,8 @@ class TestAttest:
         assert call["fields"]["name"] == "served by OpenAI (openai/gpt-4o-mini-2024-07-18)"
 
     def test_falls_back_to_the_response_when_the_record_is_late(self, captured, monkeypatch):
-        monkeypatch.setattr(prov, "_fetch_generation_record", lambda *_a: None)
-        from_response = prov.record_from_response(GEN_ID, RESPONSE_BODY, {})
-        prov._attest(captured, CONTEXT, None, GEN_ID, "Bearer k", "https://openrouter.ai", {}, from_response)
+        monkeypatch.setattr(prov, "_fetch_generation_record", lambda *_a: (None, "late"))
+        _attest(captured, prov.record_from_response(GEN_ID, RESPONSE_BODY, {}))
         (call,) = captured.calls
         attrs = call["fields"]["attributes"]
         assert attrs["gen_ai.generation.id"] == GEN_ID
@@ -184,9 +193,67 @@ class TestAttest:
         assert call["fields"]["duration_ns"] is None
 
     def test_sends_nothing_without_either_source(self, captured, monkeypatch):
-        monkeypatch.setattr(prov, "_fetch_generation_record", lambda *_a: None)
-        prov._attest(captured, CONTEXT, None, GEN_ID, "Bearer k", "https://openrouter.ai", {}, None)
+        monkeypatch.setattr(prov, "_fetch_generation_record", lambda *_a: (None, "late"))
+        _attest(captured)
         assert captured.calls == []
+
+
+def _fake_openrouter(monkeypatch, status: int, seen: list | None = None):
+    """Route the lookup's httpx.Client to a canned OpenRouter answer."""
+    real_client = httpx.Client
+
+    def handler(request):
+        if seen is not None:
+            seen.append(request)
+        return httpx.Response(status, json=GENERATION_RECORD if status == 200 else {"error": "x"})
+
+    monkeypatch.setattr(httpx, "Client", lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
+
+
+class TestLookup:
+    def test_found(self, monkeypatch):
+        _fake_openrouter(monkeypatch, 200)
+        raw, outcome = prov._fetch_generation_record(GEN_ID, "Bearer k", "https://openrouter.ai", time.monotonic() + 5)
+        assert outcome == "found"
+        assert raw == GENERATION_RECORD
+
+    def test_rejected_key_is_logged_with_its_status(self, monkeypatch, caplog):
+        _fake_openrouter(monkeypatch, 401)
+        with caplog.at_level(logging.WARNING, logger=prov.logger.name):
+            raw, outcome = prov._fetch_generation_record(
+                GEN_ID, "Bearer k", "https://openrouter.ai", time.monotonic() + 5
+            )
+        assert (raw, outcome) == (None, "rejected")
+        assert "HTTP 401" in caplog.text
+
+    def test_rejected_is_not_reported_as_late(self, captured, monkeypatch, caplog):
+        _fake_openrouter(monkeypatch, 403)
+        with caplog.at_level(logging.INFO, logger=prov.logger.name):
+            _attest(captured, prov.record_from_response(GEN_ID, RESPONSE_BODY, {}))
+        assert "HTTP 403" in caplog.text
+        assert "not published in time" not in caplog.text
+        assert len(captured.calls) == 1  # the response's own provenance still goes out
+
+    def test_lookup_stays_inside_its_budget(self, monkeypatch):
+        seen = []
+        _fake_openrouter(monkeypatch, 404, seen)
+        started = time.monotonic()
+        raw, outcome = prov._fetch_generation_record(GEN_ID, "Bearer k", "https://openrouter.ai", started + 1.0)
+        assert (raw, outcome) == (None, "late")
+        assert time.monotonic() - started < 1.0
+        assert len(seen) == 2  # attempts at 0 s and 0.5 s; the 1 s pause would pass the deadline
+
+    def test_spent_budget_makes_no_request(self, monkeypatch):
+        seen = []
+        _fake_openrouter(monkeypatch, 200, seen)
+        assert prov._fetch_generation_record(GEN_ID, "Bearer k", "https://openrouter.ai", time.monotonic() - 1) == (
+            None,
+            "late",
+        )
+        assert seen == []
+
+    def test_drain_outlasts_the_lookup_budget(self):
+        assert prov.DRAIN_TIMEOUT_SECONDS > prov.LOOKUP_BUDGET_SECONDS
 
 
 class TestSchedule:
@@ -209,6 +276,7 @@ class TestSchedule:
         assert args[4] == "Bearer sk-or-test"
         assert args[5] == "https://openrouter.ai"
         assert args[7]["provider"] == "OpenAI"
+        assert 0 < args[8] - time.monotonic() <= prov.LOOKUP_BUDGET_SECONDS
 
     @pytest.mark.parametrize(
         "kwargs",
@@ -253,8 +321,34 @@ class TestSessionDrain:
         prov.schedule_openrouter_provenance(object(), CONTEXT, None, _request(), REQUEST_BODY, RESPONSE_BODY)
         threading.Timer(0.2, release.set).start()
 
-        client_module._drain_provenance()
+        client_module._drain_provenance({"workflow_id": CONTEXT.workflow_id, "run_id": CONTEXT.run_id})
         assert finished == [True]
+
+    def test_closing_one_session_does_not_wait_for_another(self, monkeypatch):
+        release = threading.Event()
+        monkeypatch.setattr(prov, "_attest", lambda *_a: release.wait(5))
+        prov.schedule_openrouter_provenance(object(), CONTEXT, None, _request(), REQUEST_BODY, RESPONSE_BODY)
+        try:
+            started = time.monotonic()
+            client_module._drain_provenance({"workflow_id": "other-wf", "run_id": "other-run"})
+            assert time.monotonic() - started < 0.5
+        finally:
+            release.set()
+            prov.drain_openrouter_provenance(timeout=5)
+        assert not prov._pending
+
+    def test_worker_pool_is_bounded_and_daemon(self, monkeypatch):
+        release = threading.Event()
+        monkeypatch.setattr(prov, "_attest", lambda *_a: release.wait(5))
+        for _ in range(prov._MAX_WORKERS * 3):
+            prov.schedule_openrouter_provenance(object(), CONTEXT, None, _request(), REQUEST_BODY, RESPONSE_BODY)
+        try:
+            assert len(prov._workers) <= prov._MAX_WORKERS
+            assert all(worker.daemon for worker in prov._workers)
+        finally:
+            release.set()
+            prov.drain_openrouter_provenance(timeout=10)
+        assert not prov._pending
 
     @pytest.mark.parametrize(
         ("event_type", "closes"),

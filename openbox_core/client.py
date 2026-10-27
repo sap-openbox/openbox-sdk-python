@@ -142,17 +142,22 @@ def _closes_session(payload: Any) -> bool:
     return isinstance(payload, dict) and payload.get("event_type") in _SESSION_CLOSING_EVENTS
 
 
-def _drain_provenance() -> None:
-    """Let in-flight OpenRouter provenance reach Core before the session closes.
+def _drain_provenance(payload: dict[str, Any]) -> None:
+    """Let this session's in-flight OpenRouter provenance reach Core before the
+    session closes.
 
     The last model call's lookup finishes after the workflow returns; Core does
     not record spans that arrive after the session's closing event, so without
-    this wait the final call is always missing from the Provenance tab.
-    Bounded, and a no-op when nothing is pending.
+    this wait the final call is always missing from the Provenance tab. Only
+    the closing session's lookups are awaited, bounded by the lookup budget,
+    and it is a no-op when none are pending.
     """
     from .instrumentation.openrouter_provenance import drain_openrouter_provenance
 
-    drain_openrouter_provenance()
+    drain_openrouter_provenance(
+        workflow_id=str(payload.get("workflow_id") or ""),
+        run_id=str(payload.get("run_id") or ""),
+    )
 
 
 def _extract_reason_code(body: bytes | None) -> str | None:
@@ -840,7 +845,7 @@ class EvaluationClient:
         errors never raise under fail_open — they return a
         ``fallback_used=True`` ALLOW."""
         if _closes_session(payload):
-            _drain_provenance()
+            _drain_provenance(payload)
         url, headers, body = self._prepared(
             "POST", EVALUATE_PATH, EVALUATE_PATH_V2, payload, v3_path=EVALUATE_PATH_V3
         )
@@ -853,7 +858,7 @@ class EvaluationClient:
     async def aevaluate(self, payload: dict) -> EvaluationResult:
         """Async :meth:`evaluate`."""
         if _closes_session(payload):
-            await asyncio.to_thread(_drain_provenance)
+            await asyncio.to_thread(_drain_provenance, payload)
         url, headers, body = await self._aprepared(
             "POST", EVALUATE_PATH, EVALUATE_PATH_V2, payload, v3_path=EVALUATE_PATH_V3
         )

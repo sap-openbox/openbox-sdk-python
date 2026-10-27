@@ -21,10 +21,13 @@ The attribute names and semantics match the OpenRouter TypeScript SDK
 (``openbox-openrouter-sdk-ts``, ``src/provenance.ts``) so both SDKs feed the
 same panel.
 
-The work runs on a background thread after the model call has returned, so it
-is never on the critical path of the answer. The lookup reuses the bearer key
-the model call itself was sent with, so it needs no extra configuration, and
-it is best-effort: nothing here ever raises into the caller.
+The work runs on a small pool of background threads after the model call has
+returned, so it is never on the critical path of the answer. Each lookup has a
+fixed time budget counted from the end of the model call; a session's closing
+event waits only for that session's lookups, and never longer than the budget.
+The lookup reuses the bearer key the model call itself was sent with, so it
+needs no extra configuration, and it is best-effort: nothing here ever raises
+into the caller.
 """
 
 from __future__ import annotations
@@ -32,9 +35,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import re
 import threading
 import time
+from collections.abc import Callable
+from concurrent.futures import Future, wait
 from typing import Any
 from urllib.parse import quote, urlsplit
 
@@ -44,6 +50,8 @@ from ..contracts.otel_spans import HookType
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DRAIN_TIMEOUT_SECONDS",
+    "LOOKUP_BUDGET_SECONDS",
     "OPENROUTER_HOSTS",
     "drain_openrouter_provenance",
     "extract_generation_id",
@@ -59,15 +67,26 @@ __all__ = [
 OPENROUTER_HOSTS = frozenset({"openrouter.ai"})
 GENERATION_PATH = "/api/v1/generation"
 # The record is written after the response, not with it: an immediate lookup
-# 404s. Seconds to wait before each retry — about 10 s in all. Kept short on
-# purpose: a session's closing event waits for these lookups (client.py), and
-# the response-derived record is sent anyway when the lookup runs out.
+# 404s. Seconds to wait before each retry.
 _BACKOFF_SECONDS = (0.5, 1.0, 2.0, 3.0, 4.0)
-_LOOKUP_TIMEOUT_SECONDS = 4.0
+_ATTEMPT_TIMEOUT_SECONDS = 4.0
+# Hard cap on one lookup — retries, backoff and request timeouts included —
+# counted from the end of the model call, so a backlog only shortens it. When it
+# runs out the response-derived record is sent instead.
+LOOKUP_BUDGET_SECONDS = 12.0
+# A closing event waits this long for its session's lookups: the budget plus
+# time to send the span, so the wait never ends before the lookup does.
+DRAIN_TIMEOUT_SECONDS = LOOKUP_BUDGET_SECONDS + 5.0
+_MAX_WORKERS = 4
 _GENERATION_ID = re.compile(r'"id"\s*:\s*"(gen-[A-Za-z0-9_-]+)"')
 
-_pending: set[threading.Thread] = set()
+SessionKey = tuple[str, str]
+
+# Pending lookups per session (workflow_id, run_id).
+_pending: dict[SessionKey, set[Future[None]]] = {}
 _pending_lock = threading.Lock()
+_work: queue.SimpleQueue[tuple[Future[None], Callable[[], None]]] = queue.SimpleQueue()
+_workers: list[threading.Thread] = []
 
 
 def _enabled() -> bool:
@@ -297,18 +316,32 @@ def provenance_attributes(p: dict[str, Any]) -> dict[str, Any]:
     return attrs
 
 
-def _fetch_generation_record(generation_id: str, authorization: str, base_url: str) -> Any:
+def _fetch_generation_record(
+    generation_id: str, authorization: str, base_url: str, deadline: float
+) -> tuple[Any, str]:
+    """``(record, outcome)``; outcome is ``"found"``, ``"late"`` (not published
+    within the budget) or ``"rejected"`` (any other HTTP status)."""
     import httpx
 
     from .http import suppress_http_instrumentation
 
     url = f"{base_url}{GENERATION_PATH}?id={quote(generation_id)}"
-    with suppress_http_instrumentation(), httpx.Client(timeout=_LOOKUP_TIMEOUT_SECONDS) as client:
+    with suppress_http_instrumentation(), httpx.Client() as client:
         for attempt in range(len(_BACKOFF_SECONDS) + 1):
             if attempt:
-                time.sleep(_BACKOFF_SECONDS[attempt - 1])
+                pause = _BACKOFF_SECONDS[attempt - 1]
+                if time.monotonic() + pause >= deadline:
+                    break
+                time.sleep(pause)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             try:
-                response = client.get(url, headers={"Authorization": authorization})
+                response = client.get(
+                    url,
+                    headers={"Authorization": authorization},
+                    timeout=min(_ATTEMPT_TIMEOUT_SECONDS, remaining),
+                )
             except httpx.HTTPError as exc:
                 logger.debug("generation lookup %s attempt %d failed: %s", generation_id, attempt, exc)
                 continue
@@ -318,9 +351,16 @@ def _fetch_generation_record(generation_id: str, authorization: str, base_url: s
             if response.status_code == 404:
                 continue  # not written yet
             if response.status_code != 200:
-                return None
-            return response.json()
-    return None
+                # 401/403 mean the key cannot read generation records; 5xx is
+                # OpenRouter's side. Either way, say so rather than "late".
+                logger.warning(
+                    "OpenRouter generation lookup for %s failed: HTTP %d",
+                    generation_id,
+                    response.status_code,
+                )
+                return None, "rejected"
+            return response.json(), "found"
+    return None, "late"
 
 
 def _attest(
@@ -332,21 +372,24 @@ def _attest(
     base_url: str,
     requested: dict[str, Any],
     from_response: dict[str, Any] | None,
+    deadline: float,
 ) -> None:
-    raw = _fetch_generation_record(generation_id, authorization, base_url)
+    raw, outcome = _fetch_generation_record(generation_id, authorization, base_url, deadline)
     if raw is not None:
         record = normalize_generation_record(generation_id, raw, requested)
     elif from_response is not None:
-        # The record is late; the response still names provider, model and cost.
-        logger.info(
-            "generation record for %s not published in time — sending the response's own provenance",
-            generation_id,
-        )
+        # No record; the response still names provider, model and cost.
+        if outcome == "late":
+            logger.info(
+                "generation record for %s not published in time — sending the response's own provenance",
+                generation_id,
+            )
         record = from_response
     else:
         logger.warning(
-            "routing provenance unavailable for %s — the generation record did not appear in time",
+            "routing provenance unavailable for %s — no generation record (%s) and none in the response",
             generation_id,
+            outcome,
         )
         return
 
@@ -410,32 +453,77 @@ def schedule_openrouter_provenance(
     base_url = f"{parts.scheme}://{parts.netloc}"
     requested = extract_requested_routing(request_body)
     from_response = record_from_response(generation_id, response_body, requested)
+    deadline = time.monotonic() + LOOKUP_BUDGET_SECONDS
+    key: SessionKey = (context.workflow_id or "", context.run_id or "")
 
     def run() -> None:
         try:
             _attest(
                 runtime, context, parent_span, generation_id, authorization, base_url, requested,
-                from_response,
+                from_response, deadline,
             )
         except Exception:
             logger.warning("routing provenance failed for %s", generation_id, exc_info=True)
+
+    _submit(key, run)
+
+
+def _submit(key: SessionKey, fn: Callable[[], None]) -> None:
+    future: Future[None] = Future()
+    with _pending_lock:
+        _pending.setdefault(key, set()).add(future)
+        # Daemon workers: a process that exits without closing its session is
+        # never held open by a lookup. Sessions that do close are covered by
+        # the drain in client.py, and runtime.close() drains the rest.
+        if len(_workers) < _MAX_WORKERS:
+            worker = threading.Thread(target=_worker, name="openbox-provenance", daemon=True)
+            _workers.append(worker)
+            worker.start()
+
+    def task() -> None:
+        try:
+            fn()
         finally:
+            # Before the future resolves, so a drain that returns never sees a
+            # finished lookup as still pending.
             with _pending_lock:
-                _pending.discard(threading.current_thread())
+                futures = _pending.get(key)
+                if futures is not None:
+                    futures.discard(future)
+                    if not futures:
+                        del _pending[key]
 
-    # Not a daemon: the lookup waits for OpenRouter to write the record, and a
-    # daemon thread would let the process exit first and lose the evidence.
-    # The retry schedule is bounded, so this cannot hold a process open forever.
-    thread = threading.Thread(target=run, name=f"openbox-provenance-{generation_id}")
+    _work.put((future, task))
+
+
+def _worker() -> None:
+    while True:
+        future, fn = _work.get()
+        if not future.set_running_or_notify_cancel():
+            continue
+        try:
+            fn()
+        except BaseException as exc:  # pragma: no cover - fn already catches
+            future.set_exception(exc)
+        else:
+            future.set_result(None)
+
+
+def drain_openrouter_provenance(
+    workflow_id: str | None = None,
+    run_id: str | None = None,
+    timeout: float = DRAIN_TIMEOUT_SECONDS,
+) -> None:
+    """Wait (bounded) for outstanding provenance lookups.
+
+    With ``workflow_id``/``run_id``, only that session's lookups — what a
+    session's closing event needs. Without them, every pending lookup, e.g.
+    before shutdown.
+    """
     with _pending_lock:
-        _pending.add(thread)
-    thread.start()
-
-
-def drain_openrouter_provenance(timeout: float = 15.0) -> None:
-    """Wait (bounded) for outstanding provenance lookups, e.g. before shutdown."""
-    deadline = time.monotonic() + timeout
-    with _pending_lock:
-        threads = list(_pending)
-    for thread in threads:
-        thread.join(max(0.0, deadline - time.monotonic()))
+        if workflow_id is None and run_id is None:
+            futures = [f for group in _pending.values() for f in group]
+        else:
+            futures = list(_pending.get((workflow_id or "", run_id or ""), ()))
+    if futures:
+        wait(futures, timeout=timeout)
